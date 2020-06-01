@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "lib/gspro",
+    "bin/gspro-compressor",
+    "web/gsopt-web"
+]

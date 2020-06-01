@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>GS Code Compressor</title>
+    <style>
+      body {
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 16px;
+        line-height: 1.4em;
+      }
+
+      textarea {
+        font-family: "Droid Sans Mono", monospace;
+        width: 100%;
+      }
+
+      .table {
+        width: 100%;
+      }
+
+      .cell {
+        vertical-align: top;
+        padding-right: 1em;
+      }
+
+      .cell.code {
+        width: 12em;
+      }
+
+      pre {
+        font-family: "Droid Sans Mono", monospace;
+        border: 1px solid #d8d8d8;
+        background: #f8f8f8;
+        padding: 0.5em;
+        width: 100%;
+        margin-top: 0;
+        border-radius: 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div style="max-width: 100em; margin: 0 auto;">
+
+      <table class="table">
+        <tbody>
+          <tr>
+            <td class="cell code">
+              <div>Input:</div>
+              <textarea id="gs-input" rows="50" spellcheck="false"></textarea>
+              <div>
+                <button id="gs-button">Compress</button>
+              </div>
+            </td>
+            <td class="cell code">
+              <div>Output:</div>
+              <textarea id="gs-output" rows="50" spellcheck="false"></textarea>
+            </td>
+            <td class="cell">
+              <div>Details:</div>
+              <pre id="gs-details"></pre>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <noscript>This page contains webassembly and javascript content, please enable javascript in your browser.</noscript>
+    <script src="./bootstrap.js"></script>
+  </body>
+</html>

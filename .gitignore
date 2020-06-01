@@ -1,0 +1,12 @@
+.idea
+/target
+**/*.rs.bk
+/core/*/target
+*.z64
+*.sra
+*.zip
+*.htc
+*.7z
+*.exe
+*.dll
+/work
