@@ -1,3 +1,5 @@
+#[macro_use]
+mod macros;
 mod compress;
 mod gs;
 pub mod table;

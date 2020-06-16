@@ -116,10 +116,7 @@ pub fn compress_code_linear(code: &[Code]) -> Result<Vec<Code>, CompressError> {
         }
     }
 
-    for i in ignored {
-        result.push(code[i]);
-    }
-
+    result.extend_from_slice(&ignored);
     result.sort_by_key(|x| x.affected_address());
 
     Ok(result)
@@ -235,6 +232,12 @@ mod tests {
             81000006 FFFE",
             "50000402 FFFF\n81000000 0001\n",
         );
+    }
+
+    #[test]
+    fn test_linear_compress_composite() {
+        let code = "D1000008 0000\n81000002 1234\nD1000006 0000\n81000004 1234\n81000006 9999\n";
+        linear_compress_eq(code, code);
     }
 
     #[test]

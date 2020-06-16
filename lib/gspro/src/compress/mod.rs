@@ -14,13 +14,13 @@ pub enum CompressError {
 
 fn prepare_code_for_compression(
     code: &[Code],
-) -> (Vec<usize>, BTreeMap<SingleCodeType, Vec<SingleCode>>) {
+) -> (Vec<Code>, BTreeMap<SingleCodeType, Vec<SingleCode>>) {
     let (ignored, mut singles) = expand_code(code).get().iter().enumerate().fold(
         (Vec::new(), Vec::new()),
-        |(mut ignored, mut singles), (i, cur)| {
+        |(mut ignored, mut singles), (_i, cur)| {
             match cur {
                 Code::Single(s) => singles.push(*s),
-                _ => ignored.push(i),
+                x => ignored.push(*x),
             }
 
             (ignored, singles)

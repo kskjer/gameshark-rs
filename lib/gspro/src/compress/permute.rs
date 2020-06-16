@@ -1,14 +1,64 @@
 use crate::compress::{
     get_address_delta, get_repeat_count, prepare_code_for_compression, CompressError,
 };
-use crate::{line_count, Code, CompositeCode, SingleCode, SingleCodeType, ValueDelta};
-use std::collections::BTreeSet;
+use crate::{
+    line_count, make_address, Code, CompositeCode, SingleCode, SingleCodeType, ValueDelta,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{RangeInclusive, Sub};
 
 #[derive(Debug, PartialEq, Clone)]
 struct DualSeries<T> {
     da: T,
     dv: T,
     path: Vec<usize>,
+}
+
+fn get_contiguous_groups<T, S>(
+    code: &[T],
+    step: S,
+    v: impl Fn(&T) -> S,
+) -> Vec<RangeInclusive<usize>>
+where
+    S: PartialEq + Sub<Output = S>,
+{
+    code.iter()
+        .enumerate()
+        .skip(1)
+        .fold(
+            (Vec::new(), 0, 0),
+            |(mut result, good_start, last_good), (i, cur_code)| {
+                if v(cur_code) - v(&code[last_good]) != step {
+                    result.push(good_start..=last_good);
+
+                    if i + 1 == code.len() {
+                        result.push(i..=i);
+                    }
+
+                    (result, i, i)
+                } else {
+                    if i + 1 == code.len() {
+                        result.push(good_start..=i);
+                    }
+
+                    (result, good_start, i)
+                }
+            },
+        )
+        .0
+}
+
+fn mode<T>(code: impl IntoIterator<Item = T>) -> Option<(T, usize)>
+where
+    T: PartialOrd + Ord + Copy,
+{
+    let mut set = BTreeMap::new();
+
+    for c in code {
+        *set.entry(c).or_insert(0) += 1;
+    }
+
+    set.into_iter().max_by_key(|(_val, count)| *count)
 }
 
 fn find_series_for_addr_and_val(
@@ -167,7 +217,87 @@ fn compress_iter(
 
 fn compress_code_of_type(
     code_type: SingleCodeType,
-    code: Vec<SingleCode>,
+    code: &[SingleCode],
+) -> Result<Vec<Code>, CompressError> {
+    let default = compress_code_of_type_inner(code_type, code)?;
+
+    if code_type != SingleCodeType::Write16 {
+        return Ok(default);
+    }
+
+    let groups = get_contiguous_groups(code, 2, |x| x.affected_address());
+
+    test_trace!("Groups for type {:?} = {:#04X?}", code_type, groups);
+    //test_trace!("Raw form = {:#04X?}", code);
+
+    // Find the mode of the values in contiguous regions, and fill the region with that value before
+    // applying other codes. This can lead to some savings.
+    let base_fill_repeaters = groups
+        .iter()
+        .map(|x| {
+            Ok(match mode(code[x.clone()].iter().map(|x| x.rhs())) {
+                Some((mode, count)) if count >= 3 && count <= 255 => {
+                    let base_code = code[*x.start()];
+                    let repeater = Code::Composite(CompositeCode::Repeat(
+                        get_repeat_count(x.clone().count(), base_code)?,
+                        get_address_delta(2, base_code)?,
+                        ValueDelta(0),
+                        SingleCode::Write16(make_address(base_code.affected_address()), mode),
+                    ));
+
+                    Some((mode, x.clone(), repeater))
+                }
+                Some(_) | None => None,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    test_trace!("Base repeaters = {:#04X?}", base_fill_repeaters);
+
+    let (repeaters, other) = base_fill_repeaters.into_iter().enumerate().fold(
+        (Vec::new(), Vec::new()),
+        |(mut repeaters, mut other), (i, cur)| {
+            match cur {
+                Some((mode, range, repeater)) => {
+                    repeaters.push(repeater);
+                    other.extend(code[range].iter().copied().filter(|x| x.rhs() != mode));
+                }
+                None => {
+                    other.extend_from_slice(&code[groups[i].clone()]);
+                }
+            }
+
+            (repeaters, other)
+        },
+    );
+
+    test_trace!("Repeaters = {:#04X?}", repeaters);
+    test_trace!("Other = {:#04X?}", other);
+
+    let other_code = compress_code_of_type_inner(code_type, &other).map(|x| {
+        let mut tmp = repeaters.to_vec();
+
+        tmp.extend(&x);
+
+        test_trace!(
+            "Base repeater code (len {} vs default {}):\n{}",
+            tmp.len(),
+            default.len(),
+            crate::table::make_numbered_table("no.", &[("repeater", &tmp), ("default", &default),])
+        );
+
+        tmp
+    })?;
+
+    Ok(vec![other_code, default]
+        .into_iter()
+        .min_by_key(|x| x.len())
+        .unwrap())
+}
+
+fn compress_code_of_type_inner(
+    code_type: SingleCodeType,
+    code: &[SingleCode],
 ) -> Result<Vec<Code>, CompressError> {
     let mut series = find_series_for_addr_and_val(
         code.len(),
@@ -210,7 +340,7 @@ fn compress_code_of_type(
         .unwrap_or_default();
 
     if series.len() == 0 {
-        result.extend_from_slice(&code.into_iter().map(Code::Single).collect::<Vec<_>>());
+        result.extend(code.iter().copied().map(Code::Single));
     }
 
     Ok(result)
@@ -221,7 +351,7 @@ pub fn compress_code(code: &[Code]) -> Result<Vec<Code>, CompressError> {
     let mut result = Vec::new();
 
     for (code_type, code) in by_type {
-        let for_type = compress_code_of_type(code_type, code)
+        let for_type = compress_code_of_type(code_type, &code)
             .into_iter()
             .min_by_key(|x| line_count(&x))
             .expect("Result set shouldn't be empty");
@@ -229,10 +359,7 @@ pub fn compress_code(code: &[Code]) -> Result<Vec<Code>, CompressError> {
         result.extend_from_slice(&for_type);
     }
 
-    for i in ignored {
-        result.push(code[i]);
-    }
-
+    result.extend(&ignored);
     result.sort_by_key(|x| x.affected_address());
 
     Ok(result)
@@ -273,6 +400,39 @@ mod tests {
                 }
             ]
         )
+    }
+
+    #[test]
+    fn test_contiguous_groups() {
+        assert_eq!(
+            vec![0..=4, 5..=5],
+            get_contiguous_groups(&[0, 2, 4, 6, 8, 12], 2, |v| *v)
+        )
+    }
+
+    #[test]
+    fn test_contiguous_groups_tail() {
+        assert_eq!(
+            vec![0..=4, 5..=6],
+            get_contiguous_groups(&[0, 2, 4, 6, 8, 12, 14], 2, |v| *v)
+        )
+    }
+
+    #[test]
+    fn test_contiguous_groups_ben() {
+        assert_eq!(
+            vec![0..=0, 1..=1, 2..=3],
+            get_contiguous_groups(
+                &[0x81117DEAu32, 0x81117DEE, 0x81500000, 0x81500002,],
+                2,
+                |v| *v
+            )
+        )
+    }
+
+    #[test]
+    fn test_mode() {
+        assert_eq!(Some((8, 4)), mode(vec![8, 8, 8, 8, 4, 4, 2, 2, 3, 3, 3]))
     }
 
     #[test]
@@ -322,7 +482,7 @@ mod tests {
             80000029 0000
             8000002D 0000
             8000002F 0000",
-            "50000311 0000\n80000002 0000\n50000304 0000\n80000003 0000\n50000311 0000\n80000005 0000\n50000311 0000\n8000000D 0000\n50000304 0000\n80000014 0000\n50000304 0000\n80000025 0000\n",
+            "81000002 0000\n50000311 0000\n80000005 0000\n50000311 0000\n80000007 0000\n50000311 0000\n8000000B 0000\n50000311 0000\n8000000D 0000\n80000013 0000\n80000014 0000\n81000024 0000\n",
         );
     }
 
@@ -336,7 +496,7 @@ mod tests {
             81000008 0000
             8100000A 0000
             8100000C 0000",
-            "50000404 0000\n81000000 0000\n81000002 0000\n81000006 ABCD\n8100000A 0000\n",
+            "50000702 0000\n81000000 0000\n81000006 ABCD\n",
         )
     }
 
@@ -362,6 +522,122 @@ mod tests {
             81000004 0003
             80000006 00CD",
             "50000302 0001\n81000000 0001\n80000006 00CD\n",
+        )
+    }
+
+    #[test]
+    fn test_permute_ben() {
+        permute_compress_eq(
+            "D10C5480 AFB0
+            810A62A4 0C14
+            D10C5480 AFB0
+            810A62A6 0000
+            81117DEA 062A
+            81117DEE 0838
+            81500000 2404
+            81500002 0853
+            81500004 1464
+            81500006 000A
+            81500008 0000
+            8150000A 0000
+            8150000C 2404
+            8150000E 0010
+            81500010 1144
+            81500012 0004
+            81500014 0000
+            81500016 0000
+            81500018 2404
+            8150001A 062A
+            8150001C 1000
+            8150001E 0017
+            81500020 0000
+            81500022 0000
+            81500024 2404
+            81500026 0838
+            81500028 1000
+            8150002A 0014
+            8150002C 0000
+            8150002E 0000
+            81500030 2404
+            81500032 0855
+            81500034 1464
+            81500036 0004
+            81500038 0000
+            8150003A 0000
+            8150003C 2404
+            8150003E 061C
+            81500040 1000
+            81500042 000E
+            81500044 0000
+            81500046 0000
+            81500048 2404
+            8150004A 080A
+            8150004C 1464
+            8150004E 0004
+            81500050 0000
+            81500052 0000
+            81500054 2404
+            81500056 060E
+            81500058 1000
+            8150005A 0008
+            8150005C 0000
+            8150005E 0000
+            81500060 2404
+            81500062 062E
+            81500064 1464
+            81500066 0004
+            81500068 0000
+            8150006A 0000
+            8150006C 2404
+            8150006E 083A
+            81500070 1000
+            81500072 0002
+            81500074 0000
+            81500076 0000
+            81500078 0040
+            8150007A 2025
+            8150007C 0803
+            8150007E 59D3
+            81500080 0000
+            81500082 0000",
+            "D10C5480 AFB0
+810A62A4 0C14
+D10C5480 AFB0
+810A62A6 0000
+81117DEA 062A
+81117DEE 0838
+50004202 0000
+81500000 0000
+50000A0C 0000
+81500000 2404
+81500002 0853
+81500004 1464
+81500006 000A
+8150000E 0010
+81500010 1144
+81500012 0004
+8150001A 062A
+8150001C 1000
+8150001E 0017
+81500026 0838
+50000418 0000
+81500028 1000
+50000418 FFFA
+8150002A 0014
+81500032 0855
+50000318 0000
+81500034 1464
+50000318 0000
+81500036 0004
+8150003E 061C
+8150004A 080A
+81500056 060E
+81500062 062E
+8150006E 083A
+81500078 0040
+8150007A 2025
+8150007C 0803
+8150007E 59D3\n",
         )
     }
 }

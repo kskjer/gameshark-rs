@@ -146,6 +146,7 @@ impl Code {
 }
 
 pub use code_fmt::CodeDisplay;
+use std::collections::BTreeMap;
 
 mod code_fmt {
     use super::{Code, CompositeCode, SingleCode};
@@ -262,7 +263,7 @@ pub enum GsStrError {
     Code(GsCodeError),
 }
 
-fn make_address(addr: u32) -> Address {
+pub(crate) fn make_address(addr: u32) -> Address {
     Address([(addr >> 16) as u8, (addr >> 8) as u8, addr as u8])
 }
 
@@ -376,20 +377,108 @@ pub fn from_str(s: &str) -> Result<Vec<Code>, GsStrError> {
 }
 
 pub fn expand_code(code: &[Code]) -> ExpandedCode {
-    let mut result = Vec::new();
-
-    for c in code.iter().cloned() {
-        match c {
-            Code::Composite(CompositeCode::Repeat(count, da, dv, repeated)) => {
-                for i in 0..count.0.get() {
-                    result.push(Code::Single(repeated.nth_repetition(i as u32, da, dv)));
-                }
-            }
-            x => result.push(x),
-        }
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum ByteType {
+        Once,
+        Write,
     }
 
-    ExpandedCode(result)
+    let (ignored, mem) = code
+        .iter()
+        .cloned()
+        .flat_map(|x| match x {
+            Code::Composite(CompositeCode::Repeat(count, da, dv, repeated)) => (0..count.0.get())
+                .map(|i| Code::Single(repeated.nth_repetition(i as u32, da, dv)))
+                .collect::<Vec<_>>(),
+            x => vec![x],
+        })
+        .fold(
+            (Vec::new(), BTreeMap::new()),
+            |(mut ignored, mut mem), cur| {
+                match &cur {
+                    Code::Composite(_) => ignored.push(cur),
+                    Code::Single(x) => {
+                        let byte_type = match x.code_type() {
+                            SingleCodeType::Once8 | SingleCodeType::Once16 => ByteType::Once,
+                            SingleCodeType::Write8 | SingleCodeType::Write16 => ByteType::Write,
+                        };
+
+                        match x {
+                            SingleCode::Once8(addr, v) | SingleCode::Write8(addr, v) => {
+                                *mem.entry((byte_type, addr.get())).or_insert(0) = *v
+                            }
+                            SingleCode::Once16(addr, v) | SingleCode::Write16(addr, v) => {
+                                let addr = addr.get();
+                                *mem.entry((byte_type, addr)).or_insert(0) = (*v >> 8) as u8;
+                                *mem.entry((byte_type, addr + 1)).or_insert(0) = *v as u8;
+                            }
+                        }
+                    }
+                }
+
+                (ignored, mem)
+            },
+        );
+
+    let count = mem.len();
+    let mut final_code = mem
+        .into_iter()
+        .enumerate()
+        .fold(
+            (Vec::new(), Option::<(u32, u8)>::None),
+            |(mut result, prev), (i, ((code_type, addr), val))| {
+                let make_8 = |addr: u32, val: u8| {
+                    Code::Single(match code_type {
+                        ByteType::Once => SingleCode::Once8(make_address(addr), val),
+                        ByteType::Write => SingleCode::Write8(make_address(addr), val),
+                    })
+                };
+
+                let make_16 = |addr: u32, val: u16| {
+                    Code::Single(match code_type {
+                        ByteType::Once => SingleCode::Once16(make_address(addr), val),
+                        ByteType::Write => SingleCode::Write16(make_address(addr), val),
+                    })
+                };
+
+                match prev {
+                    Some((paddr, pval)) if paddr + 1 == addr => {
+                        result.push(make_16(paddr, (pval as u16) << 8 | (val as u16)));
+
+                        (result, None)
+                    }
+                    Some((paddr, pval)) => {
+                        result.push(make_8(paddr, pval));
+
+                        let prev = if addr & 1 == 0 && i + 1 != count {
+                            Some((addr, val))
+                        } else {
+                            result.push(make_8(addr, val));
+
+                            None
+                        };
+
+                        (result, prev)
+                    }
+                    None if i + 1 == count => {
+                        result.push(make_8(addr, val));
+
+                        (result, None)
+                    }
+                    None if addr & 1 != 0 => {
+                        result.push(make_8(addr, val));
+
+                        (result, None)
+                    }
+                    None => (result, Some((addr, val))),
+                }
+            },
+        )
+        .0;
+
+    final_code.extend_from_slice(&ignored);
+
+    ExpandedCode(final_code)
 }
 
 pub fn expand_and_sort(code: &[Code]) -> ExpandedCode {
@@ -411,6 +500,7 @@ pub fn line_count(codes: &[Code]) -> usize {
 mod tests {
     use super::*;
     use Code::*;
+
     use SingleCode::*;
 
     #[test]
@@ -470,6 +560,25 @@ mod tests {
                 ValueDelta(-4096)
             ),
             Write16(Address([0, 0, 1]), 0)
+        )
+    }
+
+    #[test]
+    fn test_expand_skip() {
+        assert_eq!(
+            expand_and_sort(&[
+                Code::Single(SingleCode::Write8(make_address(0), 0)),
+                Code::Single(SingleCode::Write8(make_address(2), 0)),
+                Code::Single(SingleCode::Write8(make_address(4), 0)),
+                Code::Single(SingleCode::Write8(make_address(6), 0)),
+            ])
+            .0,
+            vec![
+                Single(Write8(Address([0, 0, 0]), 0)),
+                Single(Write8(Address([0, 0, 2]), 0)),
+                Single(Write8(Address([0, 0, 4]), 0)),
+                Single(Write8(Address([0, 0, 6]), 0))
+            ]
         )
     }
 }
